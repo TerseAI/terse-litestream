@@ -177,6 +177,12 @@ impl Database {
         Ok(result)
     }
 
+    pub fn snapshot(&mut self) -> Result<SyncResult> {
+        self.ensure_live()?;
+        self.prepare()?;
+        Ok(self.capture_at_level(0, 9)?.0)
+    }
+
     /// Seeds a restored database above a replica's prior position before capturing new writes.
     pub fn recover_position(&mut self, replica: &dyn ReplicaStore) -> Result<()> {
         self.ensure_live()?;
@@ -221,14 +227,18 @@ impl Database {
     }
 
     fn capture(&mut self, max_bytes: u64) -> Result<(SyncResult, bool)> {
+        self.capture_at_level(max_bytes, 0)
+    }
+
+    fn capture_at_level(&mut self, max_bytes: u64, level: u8) -> Result<(SyncResult, bool)> {
         let (reader, snapshot, start) = self.read_position()?;
-        if !snapshot {
-            return self.capture_from(reader, false, start, max_bytes);
+        if !snapshot && level == 0 {
+            return self.capture_from(reader, false, start, max_bytes, level);
         }
         self.writer.execute_batch("BEGIN IMMEDIATE")?;
         let result = (|| {
             let reader = WalReader::new(File::open(wal_path(&self.path))?)?;
-            self.capture_from(reader, true, HEADER_SIZE, 0)
+            self.capture_from(reader, true, HEADER_SIZE, 0, level)
         })();
         let rollback = self.writer.execute_batch("ROLLBACK");
         if rollback.is_err() {
@@ -265,6 +275,7 @@ impl Database {
         snapshot: bool,
         start: u64,
         max_bytes: u64,
+        level: u8,
     ) -> Result<(SyncResult, bool)> {
         let map = reader.scan(max_bytes)?;
         if map.end == 0 && !snapshot {
@@ -290,7 +301,7 @@ impl Database {
             flags: NO_CHECKSUM,
             page_size: self.page_size,
             commit,
-            min_txid: txid,
+            min_txid: if level == 9 { 1 } else { txid },
             max_txid: txid,
             timestamp: SystemTime::now()
                 .duration_since(UNIX_EPOCH)?
@@ -301,7 +312,7 @@ impl Database {
             wal_salt: reader.salt,
             ..Header::default()
         };
-        let segment = Segment::new(0, txid, txid)?;
+        let segment = Segment::new(level, header.min_txid, txid)?;
         let writer = self.local.create(&segment)?;
         let mut encoder = Encoder::new(writer, header)?;
         self.encode_pages(&mut encoder, &map, snapshot, commit)?;
@@ -378,7 +389,7 @@ impl Database {
         self.writer.execute_batch("BEGIN IMMEDIATE")?;
         let result: Result<SyncResult> = (|| {
             let (reader, snapshot, start) = self.read_position()?;
-            let result = self.capture_from(reader, snapshot, start, 0)?.0;
+            let result = self.capture_from(reader, snapshot, start, 0, 0)?.0;
             let (_, log, done) = self.execute_checkpoint(CheckpointMode::Passive)?;
             self.restart_safe = log >= 0 && log == done;
             Ok(result)
