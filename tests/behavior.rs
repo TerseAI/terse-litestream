@@ -164,12 +164,18 @@ fn concurrent_writers_survive_checkpoint_boundaries() -> Result<()> {
         Ok(())
     });
     let mut rounds = 0;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
     while !done.load(Ordering::SeqCst) && !writer.is_finished() {
+        anyhow::ensure!(
+            std::time::Instant::now() < deadline,
+            "writer made no progress"
+        );
         db.sync()?;
         rounds += 1;
         if rounds % 5 == 0 {
             db.checkpoint(CheckpointMode::Truncate)?;
         }
+        std::thread::sleep(std::time::Duration::from_millis(2));
     }
     writer.join().unwrap()?;
     db.sync()?;
@@ -321,6 +327,68 @@ fn automatic_checkpoints_reuse_wal_without_repeated_full_snapshots() -> anyhow::
         Connection::open(output)?
             .query_row("SELECT count(*) FROM data", [], |r| r.get::<_, i64>(0))?,
         12
+    );
+    Ok(())
+}
+
+#[test]
+fn checkpoint_results_report_new_capture_and_snapshot() -> anyhow::Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("data.sqlite");
+    let sql = Connection::open(&path)?;
+    sql.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE data(value)")?;
+    let mut db = Database::open(&path, Options::default())?;
+    db.sync()?;
+    for mode in [
+        CheckpointMode::Full,
+        CheckpointMode::Restart,
+        CheckpointMode::Truncate,
+    ] {
+        let before = db.position();
+        let result = db.checkpoint(mode)?;
+        assert!(
+            result.changed && result.snapshot,
+            "checkpoint must report its published snapshot"
+        );
+        assert!(result.txid > before);
+    }
+    sql.execute("INSERT INTO data VALUES(1)", [])?;
+    let result = db.checkpoint(CheckpointMode::Passive)?;
+    assert!(result.changed);
+    assert!(!result.snapshot);
+    assert!(result.wal_bytes > 0);
+    Ok(())
+}
+
+#[test]
+fn automatic_checkpoint_contention_reports_error_and_preserves_captured_writes() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("data.sqlite");
+    let sql = Connection::open(&path)?;
+    sql.execute_batch("PRAGMA journal_mode=WAL; CREATE TABLE data(value)")?;
+    let mut db = Database::open(
+        &path,
+        Options {
+            min_checkpoint_pages: 1,
+            busy_timeout: std::time::Duration::from_millis(5),
+            ..Default::default()
+        },
+    )?;
+    db.sync()?;
+    sql.execute_batch("INSERT INTO data VALUES(1); BEGIN IMMEDIATE; INSERT INTO data VALUES(2)")?;
+    assert!(
+        db.sync().is_err(),
+        "checkpoint contention must not report a stale successful position"
+    );
+    let captured = db.position();
+    sql.execute_batch("ROLLBACK")?;
+    assert_eq!(db.sync()?.txid, captured);
+    let output = dir.path().join("output.sqlite");
+    restore(db.store(), &output, None)?;
+    assert_eq!(
+        Connection::open(output)?
+            .query_row("SELECT count(*) FROM data", [], |r| r.get::<_, i64>(0))?,
+        1
     );
     Ok(())
 }

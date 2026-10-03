@@ -52,6 +52,15 @@ pub struct SyncResult {
     pub wal_bytes: u64,
 }
 
+impl SyncResult {
+    fn merge(&mut self, next: Self) {
+        self.txid = next.txid;
+        self.changed |= next.changed;
+        self.snapshot |= next.snapshot;
+        self.wal_bytes += next.wal_bytes;
+    }
+}
+
 pub struct Database {
     writer: Connection,
     reader: Connection,
@@ -144,34 +153,28 @@ impl Database {
         let mut result = SyncResult::default();
         loop {
             let (next, limited) = self.capture(self.options.max_sync_wal_bytes)?;
-            result.txid = next.txid;
-            result.changed |= next.changed;
-            result.snapshot |= next.snapshot;
-            result.wal_bytes += next.wal_bytes;
+            result.merge(next);
             if !limited {
                 break;
             }
         }
-        self.checkpoint_if_needed()?;
-        result.txid = self.position;
+        result.merge(self.checkpoint_if_needed()?);
         Ok(result)
     }
 
     pub fn checkpoint(&mut self, mode: CheckpointMode) -> Result<SyncResult> {
         self.ensure_live()?;
         self.prepare()?;
-        self.capture(0)?;
-        if mode == CheckpointMode::Passive {
-            self.passive_checkpoint()?;
+        let mut result = self.capture(0)?.0;
+        let checkpoint = if mode == CheckpointMode::Passive {
+            self.passive_checkpoint()?
         } else {
-            self.blocking_checkpoint(mode)?;
-        }
+            self.blocking_checkpoint(mode)?
+        };
+        result.merge(checkpoint);
         self.last_checkpoint = Instant::now();
         self.dirty = false;
-        Ok(SyncResult {
-            txid: self.position,
-            ..SyncResult::default()
-        })
+        Ok(result)
     }
 
     /// Seeds a restored database above a replica's prior position before capturing new writes.
@@ -371,32 +374,31 @@ impl Database {
         Ok(())
     }
 
-    fn passive_checkpoint(&mut self) -> Result<()> {
+    fn passive_checkpoint(&mut self) -> Result<SyncResult> {
         self.writer.execute_batch("BEGIN IMMEDIATE")?;
-        let result: Result<()> = (|| {
+        let result: Result<SyncResult> = (|| {
             let (reader, snapshot, start) = self.read_position()?;
-            self.capture_from(reader, snapshot, start, 0)?;
+            let result = self.capture_from(reader, snapshot, start, 0)?.0;
             let (_, log, done) = self.execute_checkpoint(CheckpointMode::Passive)?;
             self.restart_safe = log >= 0 && log == done;
-            Ok(())
+            Ok(result)
         })();
         let rollback = self.writer.execute_batch("ROLLBACK");
         if rollback.is_err() {
             self.fenced = true;
         }
-        result?;
+        let result = result?;
         rollback?;
-        Ok(())
+        Ok(result)
     }
 
-    fn blocking_checkpoint(&mut self, mode: CheckpointMode) -> Result<()> {
+    fn blocking_checkpoint(&mut self, mode: CheckpointMode) -> Result<SyncResult> {
         // A truncate can consume commits between the pre-checkpoint sync and its lock.
         self.force_snapshot = true;
         let (busy, _, _) = self.execute_checkpoint(mode)?;
         ensure!(busy == 0, "checkpoint blocked by another SQLite reader");
         ensure_wal(&self.writer, &wal_path(&self.path))?;
-        self.capture(0)?;
-        Ok(())
+        Ok(self.capture(0)?.0)
     }
 
     fn execute_checkpoint(&mut self, mode: CheckpointMode) -> Result<(i64, i64, i64)> {
@@ -420,9 +422,13 @@ impl Database {
         Ok(result?)
     }
 
-    fn checkpoint_if_needed(&mut self) -> Result<()> {
+    fn checkpoint_if_needed(&mut self) -> Result<SyncResult> {
+        let unchanged = SyncResult {
+            txid: self.position,
+            ..SyncResult::default()
+        };
         if !self.dirty {
-            return Ok(());
+            return Ok(unchanged);
         }
         let frames = self.cursor.as_ref().map_or(0, |cursor| {
             (cursor.end - HEADER_SIZE) / (FRAME_HEADER_SIZE + u64::from(self.page_size))
@@ -433,23 +439,20 @@ impl Database {
             self.options.truncate_pages
         };
         if frames >= u64::from(truncate) {
-            self.checkpoint(CheckpointMode::Passive)?;
+            let mut result = self.checkpoint(CheckpointMode::Passive)?;
             if !self.restart_safe {
-                self.checkpoint(CheckpointMode::Truncate)?;
+                result.merge(self.checkpoint(CheckpointMode::Truncate)?);
             }
+            Ok(result)
         } else if (self.options.min_checkpoint_pages > 0
             && frames >= u64::from(self.options.min_checkpoint_pages))
             || (!self.options.checkpoint_interval.is_zero()
                 && self.last_checkpoint.elapsed() >= self.options.checkpoint_interval)
         {
-            match self.checkpoint(CheckpointMode::Passive) {
-                Err(error) if is_busy(&error) => {}
-                result => {
-                    result?;
-                }
-            }
+            self.checkpoint(CheckpointMode::Passive)
+        } else {
+            Ok(unchanged)
         }
-        Ok(())
     }
 }
 
@@ -494,8 +497,4 @@ fn wal_path(path: &Path) -> PathBuf {
     let mut path = path.as_os_str().to_os_string();
     path.push("-wal");
     PathBuf::from(path)
-}
-
-fn is_busy(error: &anyhow::Error) -> bool {
-    matches!(error.downcast_ref::<rusqlite::Error>(), Some(rusqlite::Error::SqliteFailure(code, _)) if matches!(code.code, rusqlite::ErrorCode::DatabaseBusy | rusqlite::ErrorCode::DatabaseLocked))
 }

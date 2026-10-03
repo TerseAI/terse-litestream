@@ -191,6 +191,9 @@ fn checksummed_restore_rejects_a_false_database_checksum() -> Result<()> {
     )?;
     encoder.write_page(1, &page)?;
     encoder.finish(sum)?.commit()?;
+    let valid = dir.path().join("valid.sqlite");
+    restore(&store, &valid, Some(1))?;
+    assert_eq!(fs::read(valid)?, page);
     let second = Segment::new(0, 2, 2)?;
     let mut encoder = terse_ltx::Encoder::new(
         store.create(&second)?,
