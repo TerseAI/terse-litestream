@@ -392,3 +392,42 @@ fn automatic_checkpoint_contention_reports_error_and_preserves_captured_writes()
     );
     Ok(())
 }
+
+#[test]
+fn explicit_snapshots_allow_retention_and_incremental_capture_after_reopen() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("data.sqlite");
+    let sql = Connection::open(&path)?;
+    sql.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE data(value)",
+    )?;
+    let mut db = Database::open(&path, Options::default())?;
+    db.sync()?;
+    sql.execute("INSERT INTO data VALUES(1)", [])?;
+    let snapshot = db.snapshot()?;
+    assert!(snapshot.snapshot && snapshot.changed);
+    assert_eq!(db.store().list(9)?.len(), 1);
+    let replica = FileStore::new(dir.path().join("replica"));
+    assert_eq!(replicate(db.store(), &replica)?, snapshot.txid);
+    for level in [0, 9] {
+        for segment in db.store().list(level)? {
+            if segment.level == 0 || segment.max_txid < snapshot.txid {
+                db.store().remove(&segment)?;
+            }
+        }
+    }
+    assert!(!db.sync()?.changed);
+    drop(db);
+    let mut db = Database::open(&path, Options::default())?;
+    sql.execute("INSERT INTO data VALUES(2)", [])?;
+    assert!(db.sync()?.txid > snapshot.txid);
+    replicate(db.store(), &replica)?;
+    let output = dir.path().join("output.sqlite");
+    restore(&replica, &output, None)?;
+    assert_eq!(
+        Connection::open(output)?
+            .query_row("SELECT count(*) FROM data", [], |r| r.get::<_, i64>(0))?,
+        2
+    );
+    Ok(())
+}

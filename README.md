@@ -62,6 +62,11 @@ pinned [terse-ltx](https://github.com/TerseAI/terse-ltx) library.
   first and use TRUNCATE when the configured bound cannot be relieved. External
   long-lived transactions can block checkpoints; callers must handle errors.
 
+`snapshot()` captures a complete L9 image at a new TXID. After that image is
+replicated and acknowledged by consumers, older local L0 files and snapshots can
+be removed through `ReplicaStore::remove`. Keep the newest acknowledged snapshot
+and all later captures so recovery remains possible.
+
 The filesystem backend targets local Unix filesystems supporting SQLite locking,
 atomic publication and directory fsync. Power-loss behavior still depends on the
 filesystem and storage device honoring these operations.

@@ -235,3 +235,27 @@ fn contents(sql: &Connection) -> Result<Vec<(i64, String, Vec<u8>)>> {
         .query_map([], |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)))?
         .collect::<rusqlite::Result<Vec<_>>>()?)
 }
+
+#[test]
+fn explicit_snapshots_restore_in_go_after_all_earlier_files_are_removed() -> Result<()> {
+    upstream::verify_version()?;
+    for page_size in [512, 4096, 65536] {
+        let dir = tempfile::tempdir_in("/tmp")?;
+        let path = dir.path().join("data.sqlite");
+        let sql = schema(&path, page_size)?;
+        let mut db = Database::open(&path, Options::default())?;
+        let replica = FileStore::new(dir.path().join("replica"));
+        for step in 0..=3 {
+            workload(&sql, step)?;
+            let snapshot = db.snapshot()?;
+            replicate(db.store(), &replica)?;
+            for segment in replica.list(9)? {
+                if segment.max_txid < snapshot.txid {
+                    replica.remove(&segment)?;
+                }
+            }
+            assert_restores_match(&replica, dir.path(), snapshot.txid, &sql)?;
+        }
+    }
+    Ok(())
+}
