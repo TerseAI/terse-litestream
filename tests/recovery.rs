@@ -9,7 +9,8 @@ use std::{
     },
 };
 use terse_litestream::{
-    Database, FileStore, Options, ReplicaStore, Segment, SegmentWriter, compact, replicate, restore,
+    CheckpointMode, Database, FileStore, Options, ReplicaStore, Segment, SegmentWriter, compact,
+    replicate, restore,
 };
 
 #[test]
@@ -158,6 +159,56 @@ fn position_recovery_and_replication_work_after_l0_retention() -> Result<()> {
 }
 
 #[test]
+fn resumed_restore_captures_only_changed_pages_at_the_next_transaction() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("data.sqlite");
+    let sql = initialize(&path)?;
+    sql.execute("WITH RECURSIVE n(i) AS (SELECT 1 UNION ALL SELECT i + 1 FROM n WHERE i < 20) INSERT INTO data SELECT zeroblob(3000) FROM n", [])?;
+    let mut db = Database::open(&path, Options::default())?;
+    let txid = db.sync()?.txid;
+    let replica = FileStore::new(dir.path().join("replica"));
+    replicate(db.store(), &replica)?;
+    let restored = dir.path().join("restored.sqlite");
+    restore(&replica, &restored, Some(txid))?;
+    let before = fs::read(&restored)?;
+    let local = Arc::new(FileStore::new(dir.path().join("local")));
+    let mut resumed = Database::resume(&restored, Options::default(), local.clone(), txid)?;
+    assert!(!resumed.sync()?.changed);
+    Connection::open(&restored)?.execute("INSERT INTO data VALUES(2)", [])?;
+    let capture = resumed.sync()?;
+    assert!(capture.changed && !capture.snapshot);
+    let delta = Segment::new(0, txid + 1, txid + 1)?;
+    assert_eq!(local.list(0)?, vec![delta]);
+    assert_eq!(replicate(resumed.store(), &replica)?, txid + 1);
+    let output = dir.path().join("output.sqlite");
+    restore(&replica, &output, None)?;
+    resumed.checkpoint(CheckpointMode::Passive)?;
+    let after = fs::read(&output)?;
+    assert_eq!(after, fs::read(&restored)?);
+    let changed = changed_pages(&before, &after);
+    assert_eq!(changed.len(), 1);
+    assert_eq!(ltx_pages(&local, &delta)?, changed);
+    Ok(())
+}
+
+#[test]
+fn resume_refuses_a_restored_database_with_wal_frames() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("data.sqlite");
+    let _sql = initialize(&path)?;
+    let mut db = Database::open(&path, Options::default())?;
+    let txid = db.sync()?.txid;
+    let restored = dir.path().join("restored.sqlite");
+    restore(db.store(), &restored, Some(txid))?;
+    let writer = Connection::open(&restored)?;
+    writer.execute("INSERT INTO data VALUES(2)", [])?;
+    let local = Arc::new(FileStore::new(dir.path().join("local")));
+    assert!(Database::resume(&restored, Options::default(), local.clone(), txid).is_err());
+    assert!(local.list(0)?.is_empty());
+    Ok(())
+}
+
+#[test]
 fn malformed_unicode_filenames_are_ignored() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let store = FileStore::new(dir.path());
@@ -266,6 +317,24 @@ fn initialize(path: &std::path::Path) -> Result<Connection> {
 
 fn count(path: &std::path::Path) -> Result<i64> {
     Ok(Connection::open(path)?.query_row("SELECT count(*) FROM data", [], |r| r.get(0))?)
+}
+
+fn changed_pages(before: &[u8], after: &[u8]) -> Vec<u32> {
+    after
+        .chunks(4096)
+        .enumerate()
+        .filter(|(index, page)| before.chunks(4096).nth(*index) != Some(*page))
+        .map(|(index, _)| index as u32 + 1)
+        .collect()
+}
+
+fn ltx_pages(store: &FileStore, segment: &Segment) -> Result<Vec<u32>> {
+    let mut decoder = terse_ltx::Decoder::new(store.open(segment)?)?;
+    let mut pages = Vec::new();
+    while let Some(page) = decoder.next_page()? {
+        pages.push(page.number);
+    }
+    Ok(pages)
 }
 
 struct FaultStore {
