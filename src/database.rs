@@ -22,6 +22,9 @@ pub struct Options {
     pub truncate_pages: u32,
     pub checkpoint_interval: Duration,
     pub max_sync_wal_bytes: u64,
+    /// Waits for the first write after opening to capture the base snapshot, so a database
+    /// that is only read never copies its pages. Until then the replica has no snapshot.
+    pub defer_base_snapshot: bool,
 }
 
 impl Default for Options {
@@ -32,6 +35,7 @@ impl Default for Options {
             truncate_pages: 121359,
             checkpoint_interval: Duration::from_secs(60),
             max_sync_wal_bytes: 64 << 20,
+            defer_base_snapshot: false,
         }
     }
 }
@@ -78,6 +82,9 @@ pub struct Database {
     last_checkpoint: Instant,
     dirty: bool,
     fenced: bool,
+    /// WAL length once opened; the reader's lock keeps the WAL from restarting, so it grows
+    /// exactly when a write commits.
+    opened_wal: u64,
 }
 
 struct Cursor {
@@ -121,6 +128,7 @@ impl Database {
             validate_segment(local.as_ref(), &segment)?;
         }
         let file = File::open(&path)?;
+        let opened_wal = wal_path(&path).metadata()?.len();
         Ok(Self {
             writer,
             reader,
@@ -137,6 +145,7 @@ impl Database {
             last_checkpoint: Instant::now(),
             dirty: false,
             fenced: false,
+            opened_wal,
         })
     }
 
@@ -149,6 +158,9 @@ impl Database {
 
     pub fn sync(&mut self) -> Result<SyncResult> {
         self.ensure_live()?;
+        if self.awaiting_first_write()? {
+            return Ok(SyncResult::default());
+        }
         self.prepare()?;
         let mut result = SyncResult::default();
         loop {
@@ -203,6 +215,12 @@ impl Database {
 
     pub fn close(mut self) -> Result<u64> {
         Ok(self.sync()?.txid)
+    }
+
+    fn awaiting_first_write(&self) -> Result<bool> {
+        Ok(self.options.defer_base_snapshot
+            && self.position == 0
+            && wal_path(&self.path).metadata()?.len() == self.opened_wal)
     }
 
     fn ensure_live(&self) -> Result<()> {

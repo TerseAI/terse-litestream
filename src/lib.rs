@@ -7,5 +7,5 @@ mod store;
 mod wal;
 
 pub use database::{CheckpointMode, Database, Options, SyncResult};
-pub use replica::{compact, replicate, restore, restore_plan};
-pub use store::{FileStore, ReplicaStore, Segment, SegmentWriter};
+pub use replica::{compact, replicate, restore, restore_plan, restore_with};
+pub use store::{Durability, FileStore, ReplicaStore, Segment, SegmentWriter};

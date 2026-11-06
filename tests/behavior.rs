@@ -1,7 +1,8 @@
 use anyhow::Result;
 use rusqlite::Connection;
 use terse_litestream::{
-    CheckpointMode, Database, FileStore, Options, ReplicaStore, compact, replicate, restore,
+    CheckpointMode, Database, Durability, FileStore, Options, ReplicaStore, compact, replicate,
+    restore, restore_with,
 };
 
 #[test]
@@ -428,6 +429,34 @@ fn explicit_snapshots_allow_retention_and_incremental_capture_after_reopen() -> 
         Connection::open(output)?
             .query_row("SELECT count(*) FROM data", [], |r| r.get::<_, i64>(0))?,
         2
+    );
+    Ok(())
+}
+
+#[test]
+fn scratch_replicas_take_the_deferred_base_snapshot_at_the_first_write() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let path = dir.path().join("data.sqlite");
+    let sql = Connection::open(&path)?;
+    sql.execute_batch(
+        "PRAGMA journal_mode=WAL; PRAGMA wal_autocheckpoint=0; CREATE TABLE data(value);",
+    )?;
+    let options = Options {
+        defer_base_snapshot: true,
+        ..Options::default()
+    };
+    let store = std::sync::Arc::new(FileStore::scratch(dir.path().join("local")));
+    let mut db = Database::with_store(&path, options, store.clone())?;
+    assert_eq!(db.sync()?.txid, 0);
+    sql.execute("INSERT INTO data VALUES(1)", [])?;
+    let first = db.sync()?;
+    assert!(first.changed && first.snapshot);
+    let restored = dir.path().join("restored.sqlite");
+    restore_with(store.as_ref(), &restored, None, Durability::Scratch)?;
+    assert_eq!(
+        Connection::open(restored)?
+            .query_row("SELECT count(*) FROM data", [], |r| r.get::<_, i64>(0))?,
+        1
     );
     Ok(())
 }

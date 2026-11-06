@@ -1,5 +1,5 @@
 use crate::{
-    ReplicaStore, Segment,
+    Durability, ReplicaStore, Segment,
     store::{create_directory, sync_directory},
 };
 use anyhow::{Context, Result, ensure};
@@ -44,6 +44,16 @@ pub fn restore(
     output: impl AsRef<Path>,
     target: Option<u64>,
 ) -> Result<u64> {
+    restore_with(store, output, target, Durability::Synced)
+}
+
+/// Restores like [`restore`]; a scratch restore publishes the database without fsync.
+pub fn restore_with(
+    store: &dyn ReplicaStore,
+    output: impl AsRef<Path>,
+    target: Option<u64>,
+    durability: Durability,
+) -> Result<u64> {
     let plan = restore_plan(store, target)?;
     let output = output.as_ref();
     ensure!(!output.exists(), "restore output already exists");
@@ -58,9 +68,14 @@ pub fn restore(
         verify_database_checksum(&mut file, &header, checksum)?;
     }
     file.flush()?;
-    file.as_file().sync_all()?;
+    let synced = durability == Durability::Synced;
+    if synced {
+        file.as_file().sync_all()?;
+    }
     file.persist_noclobber(output)?;
-    sync_directory(parent)?;
+    if synced {
+        sync_directory(parent)?;
+    }
     Ok(plan.last().context("empty restore plan")?.max_txid)
 }
 

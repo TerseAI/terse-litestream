@@ -53,8 +53,19 @@ impl Segment {
     }
 }
 
+/// Whether published files survive a crash.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Durability {
+    /// Every publication is fsynced with its directory.
+    #[default]
+    Synced,
+    /// Nothing is fsynced, for files whose durable copy lives elsewhere; a crash can lose them.
+    Scratch,
+}
+
 pub trait SegmentWriter: Write + Send {
-    /// Publishes an immutable file atomically and durably; errors may mean publication occurred.
+    /// Publishes an immutable file atomically, and durably unless its store is scratch; errors
+    /// may mean publication occurred.
     fn commit(self: Box<Self>) -> Result<()>;
 }
 
@@ -68,11 +79,24 @@ pub trait ReplicaStore: Send + Sync {
 #[derive(Clone, Debug)]
 pub struct FileStore {
     root: PathBuf,
+    durability: Durability,
 }
 
 impl FileStore {
     pub fn new(root: impl Into<PathBuf>) -> Self {
-        Self { root: root.into() }
+        Self::with_durability(root, Durability::Synced)
+    }
+
+    /// A store whose segments skip fsync, for a local replica whose durable copy lives elsewhere.
+    pub fn scratch(root: impl Into<PathBuf>) -> Self {
+        Self::with_durability(root, Durability::Scratch)
+    }
+
+    pub fn with_durability(root: impl Into<PathBuf>, durability: Durability) -> Self {
+        Self {
+            root: root.into(),
+            durability,
+        }
     }
     pub fn root(&self) -> &Path {
         &self.root
@@ -119,6 +143,7 @@ impl ReplicaStore for FileStore {
         Ok(Box::new(FileWriter {
             file: NamedTempFile::new_in(parent)?,
             path,
+            durability: self.durability,
         }))
     }
 
@@ -126,6 +151,9 @@ impl ReplicaStore for FileStore {
         segment.validate()?;
         let path = self.path(segment);
         fs::remove_file(&path)?;
+        if self.durability == Durability::Scratch {
+            return Ok(());
+        }
         sync_directory(path.parent().context("LTX parent missing")?)
     }
 }
@@ -133,6 +161,7 @@ impl ReplicaStore for FileStore {
 struct FileWriter {
     file: NamedTempFile,
     path: PathBuf,
+    durability: Durability,
 }
 
 impl Write for FileWriter {
@@ -147,10 +176,16 @@ impl Write for FileWriter {
 impl SegmentWriter for FileWriter {
     fn commit(mut self: Box<Self>) -> Result<()> {
         self.file.flush()?;
-        self.file.as_file().sync_all()?;
+        let synced = self.durability == Durability::Synced;
+        if synced {
+            self.file.as_file().sync_all()?;
+        }
         self.file
             .persist_noclobber(&self.path)
             .with_context(|| format!("publish {}", self.path.display()))?;
+        if !synced {
+            return Ok(());
+        }
         sync_directory(self.path.parent().context("LTX parent missing")?)
     }
 }
