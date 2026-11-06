@@ -8,7 +8,7 @@ use rusqlite::Connection;
 use std::{
     collections::BTreeSet,
     fs::File,
-    io::{Read, Seek, SeekFrom},
+    io::{ErrorKind, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
@@ -112,41 +112,43 @@ impl Database {
         options: Options,
         local: Arc<dyn ReplicaStore>,
     ) -> Result<Self> {
-        let path = path.as_ref().to_path_buf();
-        let writer = open_connection(&path, options.busy_timeout)?;
-        let mode: String = writer.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        ensure!(mode == "wal", "SQLite did not enable WAL");
-        create_control_tables(&writer)?;
-        ensure_wal(&writer, &wal_path(&path))?;
-        let reader = open_connection(&path, options.busy_timeout)?;
-        acquire_read_lock(&reader)?;
-        let page_size = writer.query_row("PRAGMA page_size", [], |row| row.get(0))?;
-        let schema_version = writer.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
-        let latest = latest_segment(local.as_ref())?;
-        let position = latest.map_or(0, |segment| segment.max_txid);
-        if let Some(segment) = latest {
-            validate_segment(local.as_ref(), &segment)?;
-        }
-        let file = File::open(&path)?;
-        let opened_wal = wal_path(&path).metadata()?.len();
-        Ok(Self {
-            writer,
-            reader,
-            file,
-            path,
-            local,
-            options,
-            page_size,
-            position,
-            cursor: None,
-            force_snapshot: true,
-            restart_safe: false,
-            schema_version,
-            last_checkpoint: Instant::now(),
-            dirty: false,
-            fenced: false,
-            opened_wal,
-        })
+        let path = path.as_ref();
+        let position = recorded_position(local.as_ref())?;
+        let writer = open_writer(path, options.busy_timeout)?;
+        ensure_wal(&writer, &wal_path(path))?;
+        Self::attach(path, options, local, writer, position)
+    }
+
+    /// Continues capture of a database that [`restore`](crate::restore) just produced at
+    /// `txid`. No snapshot is forced: the next commit is captured as an L0 delta at
+    /// `txid + 1` holding only its changed pages, and idle syncs emit nothing.
+    ///
+    /// The database file must be exactly the restored state at `txid`, unmodified since
+    /// restore, and its LTX chain must have no database checksums, like every capture here.
+    /// Neither can be verified, so this checks what it can: before opening the database, it
+    /// returns an error if the WAL holds any frames, `local` holds captures after `txid`, or
+    /// `txid` is zero. It never falls back to a snapshot; callers can use [`Self::with_store`].
+    pub fn resume(
+        path: impl AsRef<Path>,
+        options: Options,
+        local: Arc<dyn ReplicaStore>,
+        txid: u64,
+    ) -> Result<Self> {
+        let path = path.as_ref();
+        ensure!(txid > 0, "resumed position must be positive");
+        ensure!(
+            recorded_position(local.as_ref())? <= txid,
+            "local capture is ahead of the restored position"
+        );
+        ensure!(
+            wal_size(&wal_path(path))? <= HEADER_SIZE,
+            "restored database has WAL frames, so it may not match its restored position"
+        );
+        let writer = open_writer(path, options.busy_timeout)?;
+        let mut database = Self::attach(path, options, local, writer, txid)?;
+        database.cursor = Some(Cursor::wal_start(database.page_count()?));
+        database.force_snapshot = false;
+        Ok(database)
     }
 
     pub fn position(&self) -> u64 {
@@ -160,6 +162,12 @@ impl Database {
         self.ensure_live()?;
         if self.awaiting_first_write()? {
             return Ok(SyncResult::default());
+        }
+        if self.resumed_without_writes()? {
+            return Ok(SyncResult {
+                txid: self.position,
+                ..SyncResult::default()
+            });
         }
         self.prepare()?;
         let mut result = SyncResult::default();
@@ -215,6 +223,52 @@ impl Database {
 
     pub fn close(mut self) -> Result<u64> {
         Ok(self.sync()?.txid)
+    }
+
+    fn attach(
+        path: &Path,
+        options: Options,
+        local: Arc<dyn ReplicaStore>,
+        writer: Connection,
+        position: u64,
+    ) -> Result<Self> {
+        let reader = open_connection(path, options.busy_timeout)?;
+        acquire_read_lock(&reader)?;
+        let page_size = writer.query_row("PRAGMA page_size", [], |row| row.get(0))?;
+        let schema_version = writer.query_row("PRAGMA schema_version", [], |row| row.get(0))?;
+        let file = File::open(path)?;
+        let opened_wal = wal_size(&wal_path(path))?;
+        Ok(Self {
+            writer,
+            reader,
+            file,
+            path: path.to_path_buf(),
+            local,
+            options,
+            page_size,
+            position,
+            cursor: None,
+            force_snapshot: true,
+            restart_safe: false,
+            schema_version,
+            last_checkpoint: Instant::now(),
+            dirty: false,
+            fenced: false,
+            opened_wal,
+        })
+    }
+
+    fn page_count(&self) -> Result<u32> {
+        Ok(u32::try_from(
+            self.file.metadata()?.len() / u64::from(self.page_size),
+        )?)
+    }
+
+    // Skips `prepare`, whose write to create a missing WAL would itself need capturing.
+    fn resumed_without_writes(&self) -> Result<bool> {
+        Ok(!self.force_snapshot
+            && self.cursor.as_ref().is_some_and(Cursor::at_wal_start)
+            && wal_size(&wal_path(&self.path))? < HEADER_SIZE)
     }
 
     fn awaiting_first_write(&self) -> Result<bool> {
@@ -273,6 +327,11 @@ impl Database {
         if !self.force_snapshot
             && let Some(cursor) = &self.cursor
         {
+            // The read lock held since `resume` keeps checkpoints from restarting the WAL,
+            // so every frame follows the restored position whatever the salt.
+            if cursor.at_wal_start() {
+                return Ok((reader, false, HEADER_SIZE));
+            }
             if reader.salt == cursor.salt && reader.resume(cursor.end, &cursor.frame)? {
                 return Ok((reader, false, cursor.end));
             }
@@ -308,7 +367,7 @@ impl Database {
         let commit = if map.commit > 0 {
             map.commit
         } else {
-            u32::try_from(self.file.metadata()?.len() / u64::from(self.page_size))?
+            self.page_count()?
         };
         let txid = self
             .position
@@ -485,6 +544,38 @@ impl Database {
     }
 }
 
+impl Cursor {
+    /// Positions capture before the WAL's first frame, whatever its salt.
+    fn wal_start(commit: u32) -> Self {
+        Self {
+            end: HEADER_SIZE,
+            salt: [0, 0],
+            frame: Vec::new(),
+            commit,
+        }
+    }
+
+    fn at_wal_start(&self) -> bool {
+        self.end == HEADER_SIZE
+    }
+}
+
+fn recorded_position(local: &dyn ReplicaStore) -> Result<u64> {
+    let Some(segment) = latest_segment(local)? else {
+        return Ok(0);
+    };
+    validate_segment(local, &segment)?;
+    Ok(segment.max_txid)
+}
+
+fn open_writer(path: &Path, timeout: Duration) -> Result<Connection> {
+    let writer = open_connection(path, timeout)?;
+    let mode: String = writer.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+    ensure!(mode == "wal", "SQLite did not enable WAL");
+    create_control_tables(&writer)?;
+    Ok(writer)
+}
+
 fn open_connection(path: &Path, timeout: Duration) -> Result<Connection> {
     let connection = Connection::open(path)?;
     connection.busy_timeout(timeout)?;
@@ -498,10 +589,7 @@ fn create_control_tables(connection: &Connection) -> Result<()> {
 }
 
 fn ensure_wal(connection: &Connection, path: &Path) -> Result<()> {
-    if path
-        .metadata()
-        .is_ok_and(|metadata| metadata.len() >= HEADER_SIZE)
-    {
+    if wal_size(path)? >= HEADER_SIZE {
         return Ok(());
     }
     connection.execute(
@@ -509,6 +597,14 @@ fn ensure_wal(connection: &Connection, path: &Path) -> Result<()> {
         [],
     )?;
     Ok(())
+}
+
+fn wal_size(path: &Path) -> Result<u64> {
+    match path.metadata() {
+        Ok(metadata) => Ok(metadata.len()),
+        Err(error) if error.kind() == ErrorKind::NotFound => Ok(0),
+        Err(error) => Err(error.into()),
+    }
 }
 
 fn acquire_read_lock(connection: &Connection) -> Result<()> {
