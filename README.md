@@ -55,6 +55,10 @@ pinned [terse-ltx](https://github.com/TerseAI/terse-ltx) library.
   `recover_position(&replica)` **before the first sync**. This seeds the old replica
   position and forces a full capture so subsequent transactions advance past it.
   The restored database must belong to that replica's logical database.
+- To continue a replica from a fresh `restore(.., Some(txid))` without a full
+  capture, open it with `Database::resume(path, options, local, txid)` before any
+  connection writes to it. Its next commit becomes an L0 delta at `txid + 1`. It
+  refuses a WAL holding frames but cannot detect other changes to the file.
 - Application code must not independently delete/truncate WAL files, replace an
   open database, change page size, or run another replication/checkpoint owner.
   `_litestream_seq` and `_litestream_lock` are reserved control tables.
