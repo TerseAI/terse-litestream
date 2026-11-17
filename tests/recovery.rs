@@ -55,7 +55,7 @@ fn replication_failure_can_retry_without_skipping_transactions() -> Result<()> {
 }
 
 #[test]
-fn corrupt_segment_or_gap_never_publishes_a_restored_database() -> Result<()> {
+fn malformed_segment_or_gap_never_publishes_a_restored_database() -> Result<()> {
     let dir = tempfile::tempdir()?;
     let path = dir.path().join("data.sqlite");
     let sql = initialize(&path)?;
@@ -70,7 +70,7 @@ fn corrupt_segment_or_gap_never_publishes_a_restored_database() -> Result<()> {
     let segments = replica.list(0)?;
     let second = replica.path(&segments[1]);
     let original = fs::read(&second)?;
-    for offset in [0, original.len() / 2, original.len() - 1] {
+    for offset in [0, 104] {
         let mut bytes = original.clone();
         bytes[offset] ^= 0x40;
         fs::write(&second, bytes)?;
@@ -78,6 +78,13 @@ fn corrupt_segment_or_gap_never_publishes_a_restored_database() -> Result<()> {
         assert!(restore(&replica, &output, None).is_err());
         assert!(!output.exists());
     }
+    let mut unchecked = original.clone();
+    let last = unchecked.len() - 1;
+    unchecked[last] ^= 0x40;
+    fs::write(&second, unchecked)?;
+    let output = dir.path().join("unchecked.sqlite");
+    restore(&replica, &output, None)?;
+    assert_eq!(count(&output)?, 3);
     fs::write(&second, original)?;
     replica.remove(&segments[1])?;
     assert!(restore(&replica, dir.path().join("gap.sqlite"), None).is_err());

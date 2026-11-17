@@ -47,10 +47,11 @@ pinned [terse-ltx](https://github.com/TerseAI/terse-ltx) library.
   durably. Dropping an uncommitted writer must leave no listed segment. Listings
   must include acknowledged files. `FileStore` fsyncs files and directories and
   refuses replacement. An ambiguous local publication fences capture until reopen.
-- Restore requires a complete chain from transaction one. It verifies LTX file
-  checksums, checks transaction/database checksums when present, and publishes the
-  completed database without replacing an existing destination. Treat replica
-  contents as trusted backup data, not an unrestricted hostile-file upload API.
+- Restore requires a complete chain from transaction one. It validates LTX
+  structure and transaction/database checksums when present, and publishes the
+  completed database without replacing an existing destination. LTX file checksum
+  verification is skipped. Treat replica contents as trusted backup data, not an
+  unrestricted hostile-file upload API.
 - After restoring onto a host with no local capture history, call
   `recover_position(&replica)` **before the first sync**. This seeds the old replica
   position and forces a full capture so subsequent transactions advance past it.
@@ -98,8 +99,9 @@ Intentional implementation differences:
   cover writes racing with checkpoint lock acquisition. This may add a TXID.
 - `max_sync_wal_bytes` bounds each LTX batch at commit boundaries; a single
   transaction can exceed it and `sync()` drains the backlog before returning.
-- LTX files have upstream's `NO_CHECKSUM` database-checksum flag while retaining
-  their file checksum. Restore also supports checksummed LTX chains.
+- LTX files have upstream's `NO_CHECKSUM` database-checksum flag. Writers retain
+  the file checksum for format compatibility; readers do not verify it. Restore
+  also supports chains with database checksums.
 - Local publication errors require reopening to reconcile the last published
   transaction. Pre-publication write failures can be retried on the same handle.
 
