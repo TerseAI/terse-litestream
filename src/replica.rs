@@ -10,7 +10,7 @@ use std::{
 use tempfile::NamedTempFile;
 use terse_ltx::{Decoder, Header};
 
-// A restore hashes every page of the database; slicing by 16 bytes is about 8x the default table.
+// Verifying a restored database hashes every page; slicing by 16 bytes is about 8x the default table.
 const CRC: crc::Crc<u64, crc::Table<16>> =
     crc::Crc::<u64, crc::Table<16>>::new(&crc::CRC_64_GO_ISO);
 
