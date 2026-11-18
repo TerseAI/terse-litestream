@@ -10,6 +10,10 @@ use std::{
 use tempfile::NamedTempFile;
 use terse_ltx::{Decoder, Header};
 
+// A restore hashes every page of the database; slicing by 16 bytes is about 8x the default table.
+const CRC: crc::Crc<u64, crc::Table<16>> =
+    crc::Crc::<u64, crc::Table<16>>::new(&crc::CRC_64_GO_ISO);
+
 pub fn replicate(source: &dyn ReplicaStore, destination: &dyn ReplicaStore) -> Result<u64> {
     let remote = latest_segment(destination)?;
     let mut txid = remote.map_or(0, |segment| segment.max_txid);
@@ -211,7 +215,6 @@ fn verify_database_checksum(
     if header.flags & terse_ltx::NO_CHECKSUM != 0 {
         return Ok(());
     }
-    let crc = crc::Crc::<u64>::new(&crc::CRC_64_GO_ISO);
     let mut checksum = terse_ltx::CHECKSUM_FLAG;
     let mut page = vec![0; header.page_size as usize];
     file.seek(SeekFrom::Start(0))?;
@@ -220,7 +223,7 @@ fn verify_database_checksum(
         if number == 0x40000000 / header.page_size + 1 {
             continue;
         }
-        let mut hash = crc.digest();
+        let mut hash = CRC.digest();
         hash.update(&number.to_be_bytes());
         hash.update(&page);
         checksum = (checksum ^ hash.finalize()) | terse_ltx::CHECKSUM_FLAG;
