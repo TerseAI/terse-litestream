@@ -1,6 +1,6 @@
 [package]
 name = "terse-litestream"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2024"
 autotests = false
 rust-version = "1.89"
@@ -21,7 +21,7 @@ anyhow = "1"
 crc = "3.3"
 rusqlite = { version = "0.40.2", features = ["bundled"], default-features = false }
 tempfile = "3"
-terse-ltx = { version = "0.1.0", git = "https://github.com/TerseAI/terse-ltx", rev = "f3d0b64d02f5e5a013e7c733d142f9d6ee716c81" }
+terse-ltx = { version = "0.1.1", git = "https://github.com/TerseAI/terse-ltx", rev = "9b50d6a8cf07cf7cf4a630cf08d1543792021072" }
 
 [dev-dependencies]
 serde_json = "1"
